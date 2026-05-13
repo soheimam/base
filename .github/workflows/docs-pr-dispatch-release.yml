@@ -16,6 +16,11 @@ on:
         description: "Tag to dispatch (e.g. v0.8.0). Required for manual runs."
         required: true
         type: string
+      release_notes:
+        description: "Release notes body. Optional — if blank, falls back to the GitHub Release object for the tag (which may not exist for manual runs)."
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -74,6 +79,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_NOTES: ${{ github.event.inputs.release_notes }}
           GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
@@ -94,18 +100,26 @@ jobs:
           previous_tag=$(git tag --sort=-version:refname --merged "$tag" \
             | grep -v "^${tag}$" | head -n1 || true)
 
-          # Pull the release notes if a GitHub Release exists for this tag.
+          # Resolve release notes in priority order:
+          #   1. Manual workflow_dispatch input (INPUT_NOTES), if non-empty.
+          #   2. GitHub Release object body, if a release exists for the tag.
+          #   3. Empty (the Claude prompt has a "if notes are empty, return
+          #      as-is" rule, so this is a safe fallback).
           notes_file="$RUNNER_TEMP/release_notes.txt"
           : > "$notes_file"
-          if curl -sS --fail-with-body \
+          if [[ -n "${INPUT_NOTES:-}" ]]; then
+            printf '%s' "$INPUT_NOTES" > "$notes_file"
+            echo "Using release notes from workflow_dispatch input ($(wc -c < "$notes_file") bytes)."
+          elif curl -sS --fail-with-body \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${REPO}/releases/tags/${tag}" \
               -o "$RUNNER_TEMP/release.json" 2>/dev/null; then
             jq -r '.body // ""' "$RUNNER_TEMP/release.json" > "$notes_file"
+            echo "Using release notes from GitHub Release object for ${tag}."
           else
-            echo "(no GitHub release object for ${tag} — sending empty notes)"
+            echo "(no GitHub release object for ${tag} and no workflow_dispatch notes — sending empty notes)"
           fi
 
           {
@@ -186,3 +200,4 @@ jobs:
           fi
 
           echo "Dispatched '$EVENT_TYPE' to $DOCS_REPOSITORY for tag ${TAG}"
+          echo "::notice title=Docs release dispatch sent::Tag ${TAG} dispatched to ${DOCS_REPOSITORY}. The receiver will open a docs PR for the version bump + release-notes prose."
