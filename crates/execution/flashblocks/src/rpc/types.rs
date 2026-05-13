@@ -13,6 +13,29 @@
 //!   docs (`base-v1-upgrade.mdx`) calling out exactly which payload shapes
 //!   changed and what consumers need to do.
 //!
+//! # Breaking changes in v0.8.0
+//!
+//! Three serialized-shape changes shipped in v0.8.0. Consumers built against
+//! v0.7.x must update their deserializers before upgrading the node:
+//!
+//! 1. **`gasUsed` is now required** on every `TransactionWithLogs` payload
+//!    emitted by `newFlashblockTransactions`. Previously the field was an
+//!    `Option<u64>` and consumers had to handle `null`. Pre-confirmed
+//!    `gasUsed` is identical to the eventual `eth_getTransactionReceipt`
+//!    value for the same transaction hash.
+//! 2. **The `full` parameter on `newFlashblockTransactions` now has three
+//!    modes** (Full / Hashes / Filter) instead of the previous two
+//!    (Full / Hashes). Passing a log-filter object as the second argument
+//!    now returns full `TransactionWithLogs` only for transactions whose
+//!    logs match the filter. Passing `false` is still equivalent to
+//!    Hashes mode.
+//! 3. **`pendingLogs` payloads now use the full standard `Log` object
+//!    shape**. Earlier versions emitted a trimmed shape that omitted
+//!    `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`,
+//!    `logIndex`, and `removed`. As of v0.8.0 the payload matches the
+//!    shape returned by `eth_getLogs` byte-for-byte (with `blockHash`
+//!    fixed to `0x000…000` because the block hash is not yet known).
+//!
 //! Consumers caching flashblock state across reconnects should additionally
 //! verify the [`Flashblock`]-level `parent_hash` against the parent hash of
 //! their last cached pending block. Reorgs and sequencer failovers can produce
@@ -71,18 +94,41 @@ pub struct TransactionWithLogs {
     pub transaction: Transaction,
     /// Logs emitted by this transaction during its flashblock execution.
     ///
-    /// Each [`Log`] is the standard Ethereum log shape: `address`, `topics`,
-    /// `data`, plus the block/transaction context fields. `blockHash` is set
-    /// to the partial-block hash at time of pre-confirmation — this is a
-    /// flashblock hash, not the eventual sealed-block hash, and consumers
-    /// must not treat it as canonical until the block is sealed. `removed`
-    /// is always `false`; flashblock logs do not currently surface reorg
-    /// removals via this subscription (a future minor release may add this).
+    /// Each entry is a full standard Ethereum log object. The serialized
+    /// shape (camelCase) has the following fields:
+    ///
+    /// - `address` — contract address that emitted the log.
+    /// - `topics` — array of up to four 32-byte indexed topics.
+    /// - `data` — non-indexed log data, hex-encoded bytes.
+    /// - `blockHash` — partial-block hash at time of pre-confirmation. This
+    ///   is a flashblock hash, NOT the eventual sealed-block hash; consumers
+    ///   must not treat it as canonical until the block is sealed.
+    /// - `blockNumber` — block height the log was emitted in.
+    /// - `transactionHash` — hash of the enclosing transaction.
+    /// - `transactionIndex` — position of the transaction within the
+    ///   in-progress block.
+    /// - `logIndex` — position of the log within the transaction.
+    /// - `removed` — always `false`. Flashblock logs do not currently surface
+    ///   reorg removals via this subscription (a future minor release may
+    ///   add this).
+    ///
+    /// This shape matches `eth_getLogs` byte-for-byte except for the
+    /// `blockHash` caveat above.
     pub logs: Vec<Log>,
-    /// Gas consumed by this transaction's execution, in wei units of gas
-    /// (i.e. a count, not a price). Encoded as a hex quantity per JSON-RPC
-    /// convention. Required field as of v0.8.0 — earlier versions returned
-    /// an optional `Option<u64>` here and consumers had to handle `null`.
+    /// Gas consumed by this transaction's execution, encoded as a hex
+    /// quantity per JSON-RPC convention.
+    ///
+    /// **Breaking change in v0.8.0**: this field is now required and is
+    /// always present on every `newFlashblockTransactions` payload.
+    /// Earlier versions used `Option<u64>` and serialized as `null` for
+    /// transactions whose pre-confirmed execution had not yet produced a
+    /// gas measurement; consumers had to handle that case. As of v0.8.0
+    /// the executor emits the payload only after the gas measurement is
+    /// available, so the field is unconditionally present.
+    ///
+    /// The pre-confirmed `gasUsed` value matches the value the same
+    /// transaction will surface from `eth_getTransactionReceipt` after the
+    /// block is sealed. See the migration note in `base-v1-upgrade.mdx`.
     #[serde(with = "alloy_serde::quantity")]
     pub gas_used: u64,
     /// EIP-658 transaction status: `0x1` on success, `0x0` on revert.
@@ -157,6 +203,25 @@ pub enum BaseSubscriptionKind {
     /// transactions array is always hydrated — flashblock subscriptions never
     /// return transaction hashes only.
     ///
+    /// The block envelope contains the following fields (camelCase):
+    ///
+    /// - `number` — block height, hex quantity.
+    /// - `hash` — partial-block hash. Differs from the sealed-block hash.
+    /// - `parentHash` — parent block's sealed hash.
+    /// - `stateRoot`, `receiptsRoot`, `transactionsRoot` — partial-state
+    ///   roots; will differ from final sealed values.
+    /// - `gasUsed` — cumulative gas consumed by all transactions in the
+    ///   in-progress block up to this flashblock. Required field as of
+    ///   v0.8.0; monotonically increases across flashblocks at the same
+    ///   block height.
+    /// - `gasLimit` — block gas limit, fixed for the duration of the
+    ///   in-progress block.
+    /// - `baseFeePerGas` — EIP-1559 base fee in wei, hex quantity. Fixed
+    ///   for the duration of the in-progress block.
+    /// - `timestamp` — block timestamp; fixed for the duration of the
+    ///   in-progress block.
+    /// - `transactions` — hydrated transaction objects, in inclusion order.
+    ///
     /// Key differences from a sealed block:
     /// - `hash`, `stateRoot`, `receiptsRoot`, `transactionsRoot` reflect the
     ///   partial state at time of emission and will differ from the final
@@ -183,12 +248,26 @@ pub enum BaseSubscriptionKind {
     ///
     /// # Payload shape
     ///
-    /// Each notification's `result` is a single [`Log`] object — the standard
-    /// Ethereum log shape (`address`, `topics`, `data`, plus block/transaction
-    /// context). `blockHash` is always `0x000...000` (all zeros) for pending
-    /// logs because the block hash is not yet known. `removed` is always
-    /// `false`; pending logs do not surface reorg removals through this
-    /// subscription.
+    /// Each notification's `result` is a single full standard Ethereum log
+    /// object with all of the following fields (camelCase):
+    ///
+    /// - `address` — contract address that emitted the log.
+    /// - `topics` — array of up to four 32-byte indexed topics.
+    /// - `data` — non-indexed log data, hex-encoded bytes.
+    /// - `blockHash` — always `0x000…000` (all zeros). The sealed-block hash
+    ///   is not yet known when a pending log fires.
+    /// - `blockNumber` — block height the log was emitted in.
+    /// - `transactionHash` — hash of the transaction that emitted the log.
+    /// - `transactionIndex` — position of the transaction within the
+    ///   in-progress block.
+    /// - `logIndex` — position of the log within the transaction.
+    /// - `removed` — always `false`. Pending logs do not surface reorg
+    ///   removals through this subscription.
+    ///
+    /// As of v0.8.0 this matches the `eth_getLogs` payload shape
+    /// byte-for-byte except for the `blockHash` caveat. Earlier versions
+    /// emitted a trimmed shape that omitted several of the context fields
+    /// above — see the v0.8.0 breaking-change note at the module level.
     ///
     /// # Filter semantics
     ///
@@ -206,17 +285,21 @@ pub enum BaseSubscriptionKind {
     ///
     /// # Modes
     ///
-    /// The second `eth_subscribe` parameter controls payload content:
-    /// - `true` — Returns full [`TransactionWithLogs`] objects: transaction
-    ///   fields + logs + receipt-shaped fields (`gasUsed`, `status`,
-    ///   `cumulativeGasUsed`, `contractAddress`, `logsBloom`).
-    /// - `false` (default) — Returns transaction hash strings only. Consumers
-    ///   that want details should follow up with `eth_getTransactionByHash`
-    ///   on the same Flashblocks endpoint.
+    /// The second `eth_subscribe` parameter controls payload content. As of
+    /// v0.8.0 there are three modes (previously two — log-filter mode is
+    /// the new addition):
+    ///
+    /// - `true` — Full mode. Returns full [`TransactionWithLogs`] objects:
+    ///   transaction fields + logs + receipt-shaped fields (`gasUsed`,
+    ///   `status`, `cumulativeGasUsed`, `contractAddress`, `logsBloom`).
+    /// - `false` (default) — Hashes mode. Returns transaction hash strings
+    ///   only. Consumers that want details should follow up with
+    ///   `eth_getTransactionByHash` on the same Flashblocks endpoint.
     /// - A log-filter object (`{ "address": "0x…", "topics": [...] }`) —
-    ///   Returns full [`TransactionWithLogs`] for transactions where at
-    ///   least one emitted log matches the filter. All logs of the matching
-    ///   transaction are included, not just the matching ones.
+    ///   Filter mode (new in v0.8.0). Returns full [`TransactionWithLogs`]
+    ///   for transactions where at least one emitted log matches the
+    ///   filter. All logs of the matching transaction are included, not
+    ///   just the matching ones.
     ///
     /// # Ordering and dedup
     ///
