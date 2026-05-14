@@ -10,6 +10,17 @@ on:
       - "crates/consensus/rpc/**"
       - "crates/proof/rpc/**"
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "Override BASE_SHA for the diff. Leave blank for HEAD^."
+        required: false
+        type: string
+        default: ""
+      target_sha:
+        description: "Override AFTER_SHA for the diff. Leave blank for HEAD."
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -70,13 +81,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          fetch-depth: 2
+          # 0 = full history. Needed so historical SHAs passed via
+          # workflow_dispatch inputs (demo replays) are reachable. For normal
+          # pushes 2 is enough, but the cost of full fetch is a few seconds
+          # and the simplicity is worth it.
+          fetch-depth: 0
 
       - name: Compute diff and changed paths
         id: diff
         env:
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.sha }}
+          # When fired via workflow_dispatch with explicit inputs we honor those
+          # (used for demo replays where we want to dispatch a historical diff).
+          # On real pushes both inputs are absent → fall through to the event's
+          # before/after SHAs.
+          BEFORE_SHA: ${{ github.event.inputs.base_sha || github.event.before }}
+          AFTER_SHA: ${{ github.event.inputs.target_sha || github.sha }}
         run: |
           set -euo pipefail
 
