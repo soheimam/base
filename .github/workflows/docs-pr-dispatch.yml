@@ -31,7 +31,13 @@ permissions:
 
 env:
   DOCS_REPOSITORY: soheimam/nodes-docs
-  DIFF_SIZE_LIMIT: 51200
+  # GitHub Actions client_payload has a 64KB hard ceiling; sit just under it.
+  # The 50KB original was conservative but caused diff_truncated=true on real
+  # releases (v0.7.7 → v0.8.0 watched-paths diff). Truncation gives Claude no
+  # line-level context and the model conservatively returns unchanged content
+  # for reference pages (rule #9 source-grounded). Bumping to 63KB usually
+  # avoids truncation on real release-scale dispatches.
+  DIFF_SIZE_LIMIT: 64512
   # Code-change dispatches use this event_type. Release dispatches use a
   # different one and are fired from docs-pr-dispatch-release.yml.
   EVENT_TYPE: base-code-changed
