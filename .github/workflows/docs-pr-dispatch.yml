@@ -185,14 +185,26 @@ jobs:
           set -euo pipefail
 
           truncated=false
-          diff_arg=("--arg" "diff" "")
+          diff_to_send="$DIFF_PATH"
 
           if (( DIFF_SIZE > DIFF_SIZE_LIMIT )); then
-            echo "Diff is $DIFF_SIZE bytes (> $DIFF_SIZE_LIMIT); omitting from payload."
+            # Truncate-and-include rather than omit. The agent gets partial
+            # line-level context for the first ~limit bytes of files (sorted
+            # alphabetically by git diff) and still has changed_paths + PR
+            # title for the rest. Net effect on real release-scale dispatches:
+            # some pages get real edits instead of all noop'd.
+            #
+            # We reserve ~2KB of headroom for the JSON envelope (event_type,
+            # client_payload wrapping, pr_title, pr_body, changed_paths
+            # array). With a 64512 limit on the diff, total payload comes in
+            # at ~62-63KB.
+            truncate_to=$((DIFF_SIZE_LIMIT - 2048))
+            echo "Diff is $DIFF_SIZE bytes (> $DIFF_SIZE_LIMIT); truncating to first $truncate_to bytes."
+            head -c "$truncate_to" "$DIFF_PATH" > "$DIFF_PATH.truncated"
+            diff_to_send="$DIFF_PATH.truncated"
             truncated=true
-          else
-            diff_arg=("--rawfile" "diff" "$DIFF_PATH")
           fi
+          diff_arg=("--rawfile" "diff" "$diff_to_send")
 
           payload_file="$RUNNER_TEMP/dispatch.json"
           jq -n \
