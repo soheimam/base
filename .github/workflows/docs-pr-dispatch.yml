@@ -91,7 +91,12 @@ jobs:
           diff_file="$RUNNER_TEMP/node-methods.diff"
           changed_paths_file="$RUNNER_TEMP/changed-paths.json"
 
-          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+          # Three cases for $BEFORE_SHA:
+          #   1. Normal push: a real parent SHA → diff against it.
+          #   2. Initial push to a branch: all-zeros sentinel → use HEAD^.
+          #   3. workflow_dispatch: empty (event has no `before` field) → use HEAD^.
+          # Cases 2 and 3 collapse to the same fallback.
+          if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
             base="${AFTER_SHA}^"
           else
             base="$BEFORE_SHA"
