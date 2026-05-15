@@ -41,6 +41,15 @@ env:
   # Code-change dispatches use this event_type. Release dispatches use a
   # different one and are fired from docs-pr-dispatch-release.yml.
   EVENT_TYPE: base-code-changed
+  # The "effective" source SHA — what the receiver should treat as the
+  # commit that drove this dispatch. On a real push to main this is just
+  # github.sha. On a workflow_dispatch replay it's the `target_sha` input,
+  # so the receiver's branch name + PR title + provenance links all
+  # reference the diff content rather than whatever happened to be at
+  # base/main HEAD when we replayed the dispatch. Without this, every
+  # replay collapses onto the same branch (`docs/sync-code-change-<HEAD>`)
+  # and the second run silently overwrites the first run's PR.
+  EFFECTIVE_SHA: ${{ github.event.inputs.target_sha || github.sha }}
 
 jobs:
   notify:
@@ -148,7 +157,11 @@ jobs:
           # Use the auto-injected workflow token; no gh CLI, no third-party tooling.
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          # Look up the PR for the SHA the diff actually lands at — on a
+          # workflow_dispatch replay this is target_sha, not the dispatcher
+          # run's HEAD. Otherwise the PR title/body in the docs PR come from
+          # the wrong upstream PR.
+          SHA: ${{ env.EFFECTIVE_SHA }}
         run: |
           set -euo pipefail
 
@@ -196,7 +209,12 @@ jobs:
         if: steps.transport.outputs.use_artifact == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: sync-diff-${{ github.sha }}
+          # Key the artifact off the workflow run id (always unique) rather
+          # than github.sha — two replays of the same target_sha must not
+          # collide on artifact storage, and the receiver pulls by
+          # diff_artifact_run_id + diff_artifact_name so semantic SHAs
+          # aren't needed here.
+          name: sync-diff-${{ github.run_id }}
           path: ${{ steps.diff.outputs.diff_path }}
           retention-days: 7
           if-no-files-found: error
@@ -208,7 +226,10 @@ jobs:
           DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
           CHANGED_PATHS_PATH: ${{ steps.diff.outputs.changed_paths_path }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          SHA: ${{ github.sha }}
+          # Effective source SHA — see comment on EFFECTIVE_SHA above. The
+          # receiver derives branch name, PR title, and provenance from
+          # this; using github.sha here collapses every replay into one PR.
+          SHA: ${{ env.EFFECTIVE_SHA }}
           USE_ARTIFACT: ${{ steps.transport.outputs.use_artifact }}
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -223,7 +244,8 @@ jobs:
           if [[ "$USE_ARTIFACT" == "true" ]]; then
             diff_arg=("--arg" "diff" "")
             artifact_run_id="$RUN_ID"
-            artifact_name="sync-diff-$SHA"
+            # Must match the `name:` we used in the Upload step above.
+            artifact_name="sync-diff-$RUN_ID"
           else
             diff_arg=("--rawfile" "diff" "$DIFF_PATH")
             artifact_run_id=""
@@ -276,7 +298,9 @@ jobs:
         env:
           DOCS_PAT: ${{ secrets.DOCS_REPO_TOKEN }}
           PAYLOAD_PATH: ${{ steps.payload.outputs.payload_path }}
-          SHA: ${{ github.sha }}
+          # Notice banner + log line should show the SHA the receiver will
+          # actually document, not whatever happened to be at base/main HEAD.
+          SHA: ${{ env.EFFECTIVE_SHA }}
         run: |
           set -euo pipefail
 
