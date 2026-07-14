@@ -51,7 +51,11 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          perm=$(curl -sS --fail-with-body \
+          # No --fail-with-body: the endpoint 404s for identities that are not
+          # collaborators (e.g. bot/app actors), and that body parses to
+          # permission "none" — a clean, intentional refusal below rather than
+          # a raw curl error. API errors also parse to "none" (fail closed).
+          perm=$(curl -sS \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -80,7 +84,6 @@ jobs:
           REPO: ${{ github.repository }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           INPUT_NOTES: ${{ github.event.inputs.release_notes }}
-          GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
 
@@ -110,16 +113,27 @@ jobs:
           if [[ -n "${INPUT_NOTES:-}" ]]; then
             printf '%s' "$INPUT_NOTES" > "$notes_file"
             echo "Using release notes from workflow_dispatch input ($(wc -c < "$notes_file") bytes)."
-          elif curl -sS --fail-with-body \
+          else
+            # Distinguish "no release exists" (404, legitimate empty-notes
+            # case) from a transient API failure — the latter must fail the
+            # run, not silently version-bump docs with no prose context.
+            status=$(curl -sS \
+              -o "$RUNNER_TEMP/release.json" \
+              -w "%{http_code}" \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${REPO}/releases/tags/${tag}" \
-              -o "$RUNNER_TEMP/release.json" 2>/dev/null; then
-            jq -r '.body // ""' "$RUNNER_TEMP/release.json" > "$notes_file"
-            echo "Using release notes from GitHub Release object for ${tag}."
-          else
-            echo "(no GitHub release object for ${tag} and no workflow_dispatch notes — sending empty notes)"
+              "https://api.github.com/repos/${REPO}/releases/tags/${tag}")
+            if [[ "$status" == "200" ]]; then
+              jq -r '.body // ""' "$RUNNER_TEMP/release.json" > "$notes_file"
+              echo "Using release notes from GitHub Release object for ${tag}."
+            elif [[ "$status" == "404" ]]; then
+              echo "(no GitHub release object for ${tag} and no workflow_dispatch notes — sending empty notes)"
+            else
+              echo "Fetching the GitHub Release for ${tag} failed with HTTP ${status}:" >&2
+              cat "$RUNNER_TEMP/release.json" >&2
+              exit 1
+            fi
           fi
 
           {
@@ -127,16 +141,6 @@ jobs:
             echo "previous_tag=${previous_tag}"
             echo "notes_path=${notes_file}"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Validate DOCS_REPO_TOKEN secret is configured
-        env:
-          DOCS_PAT: ${{ secrets.DOCS_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${DOCS_PAT:-}" ]]; then
-            echo "DOCS_REPO_TOKEN secret is not configured." >&2
-            exit 1
-          fi
 
       - name: Build dispatch payload
         id: payload
@@ -176,6 +180,11 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
+
+          if [[ -z "${DOCS_PAT:-}" ]]; then
+            echo "DOCS_REPO_TOKEN secret is not configured." >&2
+            exit 1
+          fi
 
           response_body="$RUNNER_TEMP/response.txt"
           status_code=$(curl -sS \

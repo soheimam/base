@@ -3,6 +3,8 @@ name: Notify Docs
 on:
   push:
     branches: [main]
+    # Must stay in sync with the `paths=(...)` array in the "Compute diff
+    # and changed paths" step below.
     paths:
       - "crates/execution/metering/**"
       - "crates/execution/txpool-rpc/**"
@@ -22,22 +24,26 @@ on:
         type: string
         default: ""
 
+# Serialize runs but never cancel an in-flight one: each push's dispatch
+# covers only its own before..after range, so cancelling a run would lose
+# that range's docs sync permanently.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
   DOCS_REPOSITORY: soheimam/nodes-docs
-  # GitHub Actions client_payload has a 64KB hard ceiling; sit just under it.
-  # The 50KB original was conservative but caused diff_truncated=true on real
-  # releases (v0.7.7 → v0.8.0 watched-paths diff). Truncation gives Claude no
-  # line-level context and the model conservatively returns unchanged content
-  # for reference pages (rule #9 source-grounded). Bumping to 63KB usually
-  # avoids truncation on real release-scale dispatches.
-  DIFF_SIZE_LIMIT: 64512
+  # Threshold above which the diff travels as a GitHub Actions artifact
+  # instead of inline in the dispatch. Compared against the size of the
+  # fully-encoded dispatch payload — the thing GitHub actually limits
+  # (~64 KB ceiling on client_payload, including JSON escaping and the
+  # PR title/body riding alongside the diff) — not the raw diff bytes.
+  # 60 KB leaves real headroom under that ceiling; artifact transport
+  # makes a conservative threshold nearly free.
+  PAYLOAD_SIZE_LIMIT: 61440
   # Code-change dispatches use this event_type. Release dispatches use a
   # different one and are fired from docs-pr-dispatch-release.yml.
   EVENT_TYPE: base-code-changed
@@ -50,6 +56,11 @@ env:
   # replay collapses onto the same branch (`docs/sync-code-change-<HEAD>`)
   # and the second run silently overwrites the first run's PR.
   EFFECTIVE_SHA: ${{ github.event.inputs.target_sha || github.sha }}
+  # Artifact carrying the diff when the payload is oversized. Keyed off the
+  # run id (always unique) rather than github.sha — two replays of the same
+  # target_sha must not collide on artifact storage; the receiver pulls by
+  # diff_artifact_run_id + diff_artifact_name.
+  DIFF_ARTIFACT_NAME: sync-diff-${{ github.run_id }}
 
 jobs:
   notify:
@@ -77,7 +88,11 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          perm=$(curl -sS --fail-with-body \
+          # No --fail-with-body: the endpoint 404s for identities that are not
+          # collaborators (e.g. bot/app actors), and that body parses to
+          # permission "none" — a clean, intentional refusal below rather than
+          # a raw curl error. API errors also parse to "none" (fail closed).
+          perm=$(curl -sS \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -114,6 +129,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Must stay in sync with the push trigger's `paths:` filter above.
           paths=(
             "crates/execution/metering"
             "crates/execution/txpool-rpc"
@@ -144,14 +160,22 @@ jobs:
           git diff "$base" "$AFTER_SHA" --name-only -- "${paths[@]}" \
             | jq -R -s 'split("\n") | map(select(length > 0))' > "$changed_paths_file"
 
-          diff_size=$(wc -c < "$diff_file" | tr -d ' ')
-          echo "diff_size=$diff_size" >> "$GITHUB_OUTPUT"
           echo "diff_path=$diff_file" >> "$GITHUB_OUTPUT"
           echo "changed_paths_path=$changed_paths_file" >> "$GITHUB_OUTPUT"
-          echo "Computed diff: $diff_size bytes across ${#paths[@]} watched paths"
+          echo "Computed diff: $(wc -c < "$diff_file") bytes across ${#paths[@]} watched paths"
           echo "Changed files: $(jq 'length' "$changed_paths_file")"
 
+          # Possible on workflow_dispatch replays whose SHA range touches no
+          # watched path (push events are protected by the `paths:` filter).
+          # Skip the dispatch rather than spinning up the receiver's full
+          # pipeline to do nothing.
+          if [[ $(jq 'length' "$changed_paths_file") -eq 0 ]]; then
+            echo "::notice::No watched-path changes in ${base}..${AFTER_SHA}; skipping dispatch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve associated pull request
+        if: steps.diff.outputs.skip != 'true'
         id: pr
         env:
           # Use the auto-injected workflow token; no gh CLI, no third-party tooling.
@@ -165,12 +189,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The endpoint returns every PR associated with the commit, merged
+          # or not; prefer the merged one so the docs PR cites the PR that
+          # actually landed this change.
           pr_json=$(curl -sS --fail-with-body \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${REPO}/commits/${SHA}/pulls" \
-            | jq '.[0] // {}')
+            | jq '[.[] | select(.merged_at != null)][0] // .[0] // {}')
 
           number=$(jq -r '.number // ""' <<< "$pr_json")
           title=$(jq -r '.title // ""' <<< "$pr_json")
@@ -186,43 +213,10 @@ jobs:
             echo "No PR associated with this commit (direct push to main); dispatching with empty PR context."
           fi
 
-      - name: Decide diff transport (inline vs artifact)
-        id: transport
-        env:
-          DIFF_SIZE: ${{ steps.diff.outputs.diff_size }}
-        run: |
-          set -euo pipefail
-          # Small diffs travel inline in the repository_dispatch payload
-          # (fast path, no extra round-trip). Large diffs go via a GitHub
-          # Actions artifact: the dispatcher uploads, the payload references
-          # it by run-id + name, and the receiver downloads it via the
-          # GitHub API. This avoids the ~64 KB client_payload ceiling.
-          if (( DIFF_SIZE > DIFF_SIZE_LIMIT )); then
-            echo "Diff is $DIFF_SIZE bytes (> $DIFF_SIZE_LIMIT); will upload as artifact."
-            echo "use_artifact=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Diff is $DIFF_SIZE bytes (<= $DIFF_SIZE_LIMIT); embedding inline."
-            echo "use_artifact=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload diff artifact (only for oversized diffs)
-        if: steps.transport.outputs.use_artifact == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          # Key the artifact off the workflow run id (always unique) rather
-          # than github.sha — two replays of the same target_sha must not
-          # collide on artifact storage, and the receiver pulls by
-          # diff_artifact_run_id + diff_artifact_name so semantic SHAs
-          # aren't needed here.
-          name: sync-diff-${{ github.run_id }}
-          path: ${{ steps.diff.outputs.diff_path }}
-          retention-days: 7
-          if-no-files-found: error
-
       - name: Build dispatch payload
+        if: steps.diff.outputs.skip != 'true'
         id: payload
         env:
-          DIFF_SIZE: ${{ steps.diff.outputs.diff_size }}
           DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
           CHANGED_PATHS_PATH: ${{ steps.diff.outputs.changed_paths_path }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -230,71 +224,78 @@ jobs:
           # receiver derives branch name, PR title, and provenance from
           # this; using github.sha here collapses every replay into one PR.
           SHA: ${{ env.EFFECTIVE_SHA }}
-          USE_ARTIFACT: ${{ steps.transport.outputs.use_artifact }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
-          # Two payload shapes, mutually exclusive:
-          #   * inline:    diff field carries the full diff content
-          #   * artifact:  diff field is empty, diff_artifact_* fields point
-          #                at the GitHub Actions artifact on THIS run
-          # diff_truncated is reserved for a future partial-diff path. Today
-          # both shapes deliver the full diff to the receiver.
-          if [[ "$USE_ARTIFACT" == "true" ]]; then
-            diff_arg=("--arg" "diff" "")
-            artifact_run_id="$RUN_ID"
-            # Must match the `name:` we used in the Upload step above.
-            artifact_name="sync-diff-$RUN_ID"
-          else
-            diff_arg=("--rawfile" "diff" "$DIFF_PATH")
-            artifact_run_id=""
-            artifact_name=""
-          fi
-
           payload_file="$RUNNER_TEMP/dispatch.json"
-          jq -n \
-            --arg event_type "$EVENT_TYPE" \
-            --arg sha "$SHA" \
-            --arg pr_number "$PR_NUMBER" \
-            --rawfile pr_title "$RUNNER_TEMP/pr_title.txt" \
-            --rawfile pr_body "$RUNNER_TEMP/pr_body.txt" \
-            "${diff_arg[@]}" \
-            --argjson truncated false \
-            --arg diff_artifact_run_id "$artifact_run_id" \
-            --arg diff_artifact_name "$artifact_name" \
-            --slurpfile changed_paths "$CHANGED_PATHS_PATH" \
-            '{
-              event_type: $event_type,
-              client_payload: {
-                kind: "code-change",
-                sha: $sha,
-                pr_number: $pr_number,
-                pr_title: $pr_title,
-                pr_body: $pr_body,
-                diff: $diff,
-                diff_truncated: $truncated,
-                diff_artifact_run_id: $diff_artifact_run_id,
-                diff_artifact_name: $diff_artifact_name,
-                changed_paths: $changed_paths[0]
-              }
-            }' > "$payload_file"
+
+          # The payload shape is identical for both transports; only the
+          # diff-carrying fields differ:
+          #   * inline:    `diff` carries the full diff content
+          #   * artifact:  `diff` is empty, diff_artifact_* fields point at
+          #                the GitHub Actions artifact uploaded on THIS run
+          build_payload() {
+            jq -n \
+              --arg event_type "$EVENT_TYPE" \
+              --arg sha "$SHA" \
+              --arg pr_number "$PR_NUMBER" \
+              --rawfile pr_title "$RUNNER_TEMP/pr_title.txt" \
+              --rawfile pr_body "$RUNNER_TEMP/pr_body.txt" \
+              --slurpfile changed_paths "$CHANGED_PATHS_PATH" \
+              "$@" \
+              '{
+                event_type: $event_type,
+                client_payload: {
+                  kind: "code-change",
+                  sha: $sha,
+                  pr_number: $pr_number,
+                  pr_title: $pr_title,
+                  pr_body: $pr_body,
+                  diff: $diff,
+                  diff_artifact_run_id: $diff_artifact_run_id,
+                  diff_artifact_name: $diff_artifact_name,
+                  changed_paths: $changed_paths[0]
+                }
+              }' > "$payload_file"
+          }
+
+          # Build inline first (fast path, no artifact round-trip), then
+          # measure what we would actually send. GitHub's limit applies to
+          # the encoded payload — diff + PR context + JSON escaping — so
+          # that is what the threshold must be compared against, not the
+          # raw diff size.
+          build_payload \
+            --rawfile diff "$DIFF_PATH" \
+            --arg diff_artifact_run_id "" \
+            --arg diff_artifact_name ""
+          payload_size=$(wc -c < "$payload_file" | tr -d ' ')
+
+          if (( payload_size > PAYLOAD_SIZE_LIMIT )); then
+            echo "Inline payload is $payload_size bytes (> $PAYLOAD_SIZE_LIMIT); switching to artifact transport."
+            build_payload \
+              --arg diff "" \
+              --arg diff_artifact_run_id "$RUN_ID" \
+              --arg diff_artifact_name "$DIFF_ARTIFACT_NAME"
+            echo "use_artifact=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_artifact=false" >> "$GITHUB_OUTPUT"
+          fi
 
           echo "payload_path=$payload_file" >> "$GITHUB_OUTPUT"
-          echo "Payload size: $(wc -c < "$payload_file") bytes (use_artifact=$USE_ARTIFACT)"
+          echo "Payload size: $(wc -c < "$payload_file") bytes"
 
-      - name: Validate DOCS_REPO_TOKEN secret is configured
-        env:
-          DOCS_PAT: ${{ secrets.DOCS_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${DOCS_PAT:-}" ]]; then
-            echo "DOCS_REPO_TOKEN secret is not configured." >&2
-            exit 1
-          fi
+      - name: Upload diff artifact (only for oversized payloads)
+        if: steps.payload.outputs.use_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIFF_ARTIFACT_NAME }}
+          path: ${{ steps.diff.outputs.diff_path }}
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Send repository_dispatch to docs repo
+        if: steps.diff.outputs.skip != 'true'
         env:
           DOCS_PAT: ${{ secrets.DOCS_REPO_TOKEN }}
           PAYLOAD_PATH: ${{ steps.payload.outputs.payload_path }}
@@ -303,6 +304,11 @@ jobs:
           SHA: ${{ env.EFFECTIVE_SHA }}
         run: |
           set -euo pipefail
+
+          if [[ -z "${DOCS_PAT:-}" ]]; then
+            echo "DOCS_REPO_TOKEN secret is not configured." >&2
+            exit 1
+          fi
 
           response_body="$RUNNER_TEMP/response.txt"
           status_code=$(curl -sS \
